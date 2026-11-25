@@ -18,8 +18,8 @@
 extern "C" {
 #endif
 
-/** 每帧每个麦克风的采样点数；16 kHz 下对应 32 ms 音频。 */
-#define AUDIO_PIPELINE_SAMPLES_PER_CHANNEL 512U
+/** 每帧每个麦克风的采样点数；16 kHz 下对应 30 ms 音频。 */
+#define AUDIO_PIPELINE_SAMPLES_PER_CHANNEL 480U
 
 /** 中间层允许同时存在的应用订阅者上限。 */
 #define AUDIO_PIPELINE_MAX_SUBSCRIBERS 4U

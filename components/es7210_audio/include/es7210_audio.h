@@ -40,7 +40,7 @@ typedef struct {
     gpio_num_t i2s_bclk_gpio;      /**< TDM 位时钟输出引脚，对应 ES7210 SCLK。 */
     gpio_num_t i2s_lrck_gpio;      /**< TDM 帧时钟输出引脚，对应 ES7210 LRCK。 */
     gpio_num_t i2s_data_in_gpio;   /**< TDM 数据输入引脚，对应 ES7210 SDOUT1。 */
-    uint8_t i2c_address;           /**< ES7210 的 7 位 I2C 地址。 */
+    uint8_t i2c_address_7bit;      /**< ES7210 的 7 位 I2C 地址，不包含读写方向位。 */
     uint32_t sample_rate_hz;       /**< 每个麦克风通道的采样率。 */
     float microphone_gain_db;      /**< 四个模拟麦克风通道的统一前置增益。 */
     size_t dma_frame_samples;      /**< 单个 DMA 描述符容纳的每通道采样点数。 */
@@ -61,10 +61,10 @@ typedef struct {
         .i2s_bclk_gpio = GPIO_NUM_7,             \
         .i2s_lrck_gpio = GPIO_NUM_10,            \
         .i2s_data_in_gpio = GPIO_NUM_3,           \
-        .i2c_address = 0x41,                      \
+        .i2c_address_7bit = 0x41,                 \
         .sample_rate_hz = 16000,                  \
         .microphone_gain_db = 30.0f,              \
-        .dma_frame_samples = 512,                 \
+        .dma_frame_samples = 480,                 \
     }
 
 /**

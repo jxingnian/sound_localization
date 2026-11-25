@@ -8,6 +8,7 @@
 
 #include <inttypes.h>
 
+#include "audio_web_test.h"
 #include "audio_pipeline.h"
 #include "es7210_audio.h"
 #include "esp_check.h"
@@ -53,10 +54,19 @@ void app_main(void)
     sound_localization_handle_t localizer = NULL;
     ESP_ERROR_CHECK(sound_localization_init(&localization_config, &localizer));
 
-    /* 先启动消费者，再启动生产者，确保第一帧音频也能进入定位应用。 */
+    /*
+     * 网页试听是中间层的第二个独立应用订阅者。它只读取 audio_pipeline，后续新增
+     * 唤醒词或录音应用时仍可用相同方式订阅，不需要改动 ES7210 驱动。
+     */
+    audio_web_test_config_t web_test_config = AUDIO_WEB_TEST_DEFAULT_CONFIG(pipeline);
+    audio_web_test_handle_t web_test = NULL;
+    ESP_ERROR_CHECK(audio_web_test_init(&web_test_config, &web_test));
+
+    /* 先启动全部消费者，再启动生产者，确保第一帧音频能同时进入定位和网页应用。 */
     ESP_ERROR_CHECK(sound_localization_start(localizer));
+    ESP_ERROR_CHECK(audio_web_test_start(web_test));
     ESP_ERROR_CHECK(audio_pipeline_start(pipeline));
-    ESP_LOGI(TAG, "四麦克风声源定位链路已启动");
+    ESP_LOGI(TAG, "四麦克风定位与网页试听链路已启动");
 
     while (true) {
         sound_localization_result_t result;

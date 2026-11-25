@@ -1,0 +1,431 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>四路麦克风监听</title>
+  <style>
+    /* 使用设备本地字体和纯色界面，热点未连接互联网时也能完整显示。 */
+    :root {
+      color-scheme: dark;
+      --background: #101417;
+      --panel: #1b2125;
+      --line: #364047;
+      --text: #f4f7f8;
+      --muted: #a9b4ba;
+      --accent: #22c55e;
+      --accent-dark: #123b22;
+      --danger: #ef4444;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: var(--background);
+      color: var(--text);
+      font-family: system-ui, "Microsoft YaHei", sans-serif;
+      letter-spacing: 0;
+    }
+
+    main {
+      width: min(720px, 100%);
+      margin: 0 auto;
+      padding: 28px 18px 40px;
+    }
+
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      margin-bottom: 24px;
+    }
+
+    h1 {
+      margin: 0;
+      font-size: clamp(24px, 7vw, 36px);
+      font-weight: 700;
+    }
+
+    .status {
+      display: flex;
+      align-items: center;
+      flex: 0 0 auto;
+      gap: 8px;
+      color: var(--muted);
+      font-size: 14px;
+    }
+
+    .status-dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: var(--danger);
+    }
+
+    .status-dot.online { background: var(--accent); }
+
+    .monitor {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+      overflow: hidden;
+    }
+
+    canvas {
+      display: block;
+      width: 100%;
+      height: 220px;
+      background: #0b0e10;
+    }
+
+    .meter-row {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      min-height: 48px;
+      padding: 0 16px;
+      border-top: 1px solid var(--line);
+      color: var(--muted);
+      font-variant-numeric: tabular-nums;
+      font-size: 14px;
+    }
+
+    .meter {
+      height: 8px;
+      flex: 1;
+      border-radius: 4px;
+      background: #30383d;
+      overflow: hidden;
+    }
+
+    .meter-fill {
+      width: 0;
+      height: 100%;
+      background: var(--accent);
+      transition: width 80ms linear;
+    }
+
+    .controls { padding-top: 22px; }
+
+    .section-label {
+      display: block;
+      margin-bottom: 10px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .microphones {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 10px;
+    }
+
+    button {
+      min-height: 52px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #242b30;
+      color: var(--text);
+      font: inherit;
+      font-weight: 650;
+      cursor: pointer;
+      touch-action: manipulation;
+    }
+
+    button:focus-visible { outline: 3px solid #60a5fa; outline-offset: 2px; }
+    button:disabled { cursor: not-allowed; opacity: .45; }
+
+    .mic-button.selected {
+      border-color: var(--accent);
+      background: var(--accent-dark);
+      color: #a7f3c0;
+    }
+
+    .transport {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+      margin-top: 18px;
+    }
+
+    #startButton {
+      border-color: var(--accent);
+      background: var(--accent);
+      color: #07160c;
+    }
+
+    #stopButton {
+      border-color: #704044;
+      background: #321c1e;
+      color: #fecaca;
+    }
+
+    @media (max-width: 520px) {
+      main { padding-top: 20px; }
+      header { align-items: flex-start; flex-direction: column; }
+      canvas { height: 180px; }
+      .microphones { grid-template-columns: 1fr 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <h1>四路麦克风监听</h1>
+      <div class="status" aria-live="polite">
+        <span id="statusDot" class="status-dot"></span>
+        <span id="statusText">尚未启动</span>
+      </div>
+    </header>
+
+    <section class="monitor" aria-label="实时音频波形">
+      <canvas id="waveform"></canvas>
+      <div class="meter-row">
+        <span id="channelLabel">MIC 1</span>
+        <div class="meter"><div id="meterFill" class="meter-fill"></div></div>
+        <span id="levelText">-∞ dB</span>
+      </div>
+    </section>
+
+    <section class="controls">
+      <span class="section-label">选择监听通道</span>
+      <div class="microphones" role="group" aria-label="麦克风通道">
+        <button class="mic-button selected" data-channel="0">MIC 1</button>
+        <button class="mic-button" data-channel="1">MIC 2</button>
+        <button class="mic-button" data-channel="2">MIC 3</button>
+        <button class="mic-button" data-channel="3">MIC 4</button>
+      </div>
+      <div class="transport">
+        <button id="startButton">启动播放</button>
+        <button id="stopButton" disabled>停止</button>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    /* 固件输出固定为 16 kHz、PCM16 小端序单声道；浏览器播放采样率由系统决定。 */
+    const DEVICE_SAMPLE_RATE = 16000;
+    const statusDot = document.getElementById('statusDot');
+    const statusText = document.getElementById('statusText');
+    const startButton = document.getElementById('startButton');
+    const stopButton = document.getElementById('stopButton');
+    const micButtons = Array.from(document.querySelectorAll('.mic-button'));
+    const channelLabel = document.getElementById('channelLabel');
+    const meterFill = document.getElementById('meterFill');
+    const levelText = document.getElementById('levelText');
+    const canvas = document.getElementById('waveform');
+    const canvasContext = canvas.getContext('2d');
+
+    let selectedChannel = 0;
+    let socket = null;
+    let audioContext = null;
+    let workletNode = null;
+    let workletUrl = null;
+    let playing = false;
+    let latestWaveform = new Float32Array(480);
+
+    /** 更新连接状态颜色和文字，所有异步分支都通过此函数保持界面一致。 */
+    function setStatus(text, online) {
+      statusText.textContent = text;
+      statusDot.classList.toggle('online', online);
+    }
+
+    /** 发送结构化控制命令；仅在 WebSocket 完全连接时发送。 */
+    function sendCommand(action, channel) {
+      if (!socket || socket.readyState !== WebSocket.OPEN) return;
+      const command = { action };
+      if (channel !== undefined) command.channel = channel;
+      socket.send(JSON.stringify(command));
+    }
+
+    /**
+     * AudioWorklet 使用定长环形缓冲区保存设备 PCM，并用线性插值将 16 kHz 转为
+     * 浏览器输出采样率。先累计 60 ms 再播放，抵消 Wi-Fi 分组到达间隔的短时抖动。
+     */
+    const workletSource = `
+      class PcmPlayerProcessor extends AudioWorkletProcessor {
+        constructor() {
+          super();
+          this.buffer = new Float32Array(32768);
+          this.readPosition = 0;
+          this.writePosition = 0;
+          this.available = 0;
+          this.primed = false;
+          this.ratio = ${DEVICE_SAMPLE_RATE} / sampleRate;
+          this.port.onmessage = (event) => {
+            if (event.data.type === 'reset') {
+              this.readPosition = this.writePosition;
+              this.available = 0;
+              this.primed = false;
+              return;
+            }
+            const samples = event.data.samples;
+            for (let index = 0; index < samples.length; index++) {
+              if (this.available >= this.buffer.length - 1) {
+                this.readPosition = (this.readPosition + 1) % this.buffer.length;
+                this.available -= 1;
+              }
+              this.buffer[this.writePosition] = samples[index];
+              this.writePosition = (this.writePosition + 1) % this.buffer.length;
+              this.available += 1;
+            }
+            if (this.available >= 960) this.primed = true;
+          };
+        }
+
+        process(inputs, outputs) {
+          const output = outputs[0][0];
+          for (let index = 0; index < output.length; index++) {
+            if (!this.primed || this.available < 2) {
+              output[index] = 0;
+              if (this.available < 2) {
+                this.readPosition = this.writePosition;
+                this.available = 0;
+                this.primed = false;
+              }
+              continue;
+            }
+            const base = Math.floor(this.readPosition);
+            const next = (base + 1) % this.buffer.length;
+            const fraction = this.readPosition - base;
+            output[index] = this.buffer[base] * (1 - fraction) + this.buffer[next] * fraction;
+            this.readPosition = (this.readPosition + this.ratio) % this.buffer.length;
+            this.available -= this.ratio;
+          }
+          return true;
+        }
+      }
+      registerProcessor('pcm-player', PcmPlayerProcessor);
+    `;
+
+    /** 在用户点击启动的手势内创建音频上下文，以满足手机浏览器的自动播放限制。 */
+    async function prepareAudio() {
+      if (!audioContext) {
+        audioContext = new AudioContext({ latencyHint: 'interactive' });
+        const blob = new Blob([workletSource], { type: 'application/javascript' });
+        workletUrl = URL.createObjectURL(blob);
+        await audioContext.audioWorklet.addModule(workletUrl);
+        workletNode = new AudioWorkletNode(audioContext, 'pcm-player', {
+          outputChannelCount: [1]
+        });
+        workletNode.connect(audioContext.destination);
+      }
+      await audioContext.resume();
+    }
+
+    /** 把设备发来的小端 PCM16 转换为浏览器使用的 [-1, 1] 浮点采样。 */
+    function decodePcm16(arrayBuffer) {
+      const view = new DataView(arrayBuffer);
+      const samples = new Float32Array(arrayBuffer.byteLength / 2);
+      for (let index = 0; index < samples.length; index++) {
+        samples[index] = view.getInt16(index * 2, true) / 32768;
+      }
+      return samples;
+    }
+
+    /** 根据当前 PCM 帧绘制波形和峰值表，绘图不会进入音频实时处理线程。 */
+    function updateLevel(samples) {
+      latestWaveform = samples;
+      let peak = 0;
+      for (const sample of samples) peak = Math.max(peak, Math.abs(sample));
+      const decibels = peak > 0 ? 20 * Math.log10(peak) : -Infinity;
+      meterFill.style.width = `${Math.min(100, peak * 100)}%`;
+      levelText.textContent = Number.isFinite(decibels) ? `${decibels.toFixed(1)} dB` : '-∞ dB';
+    }
+
+    /** 建立到设备自身的 WebSocket；热点 IP 改动时仍跟随当前页面主机名。 */
+    function connectSocket() {
+      if (socket && (socket.readyState === WebSocket.OPEN ||
+                     socket.readyState === WebSocket.CONNECTING)) return;
+      setStatus('正在连接设备', false);
+      socket = new WebSocket(`ws://${location.host}/audio`);
+      socket.binaryType = 'arraybuffer';
+      socket.onopen = () => {
+        setStatus('正在播放', true);
+        sendCommand('start', selectedChannel);
+      };
+      socket.onmessage = (event) => {
+        if (typeof event.data === 'string') return;
+        const samples = decodePcm16(event.data);
+        updateLevel(samples);
+        /* 保留主线程采样用于波形绘制，让结构化克隆把独立副本交给音频线程。 */
+        workletNode.port.postMessage({ samples });
+      };
+      socket.onerror = () => setStatus('连接失败', false);
+      socket.onclose = () => {
+        if (playing) setStatus('连接已断开', false);
+      };
+    }
+
+    /** 启动按钮先解锁浏览器音频，再连接设备并立即播放当前选中的通道。 */
+    startButton.addEventListener('click', async () => {
+      startButton.disabled = true;
+      try {
+        await prepareAudio();
+        playing = true;
+        stopButton.disabled = false;
+        connectSocket();
+        if (socket && socket.readyState === WebSocket.OPEN) {
+          sendCommand('start', selectedChannel);
+          setStatus('正在播放', true);
+        }
+      } catch (error) {
+        playing = false;
+        startButton.disabled = false;
+        stopButton.disabled = true;
+        setStatus('浏览器无法启动音频', false);
+      }
+    });
+
+    /** 停止设备推流并清空浏览器缓冲，避免下次启动播放旧采样。 */
+    stopButton.addEventListener('click', () => {
+      playing = false;
+      sendCommand('stop');
+      if (workletNode) workletNode.port.postMessage({ type: 'reset' });
+      if (audioContext) audioContext.suspend();
+      startButton.disabled = false;
+      stopButton.disabled = true;
+      setStatus('已停止', socket && socket.readyState === WebSocket.OPEN);
+      updateLevel(new Float32Array(480));
+    });
+
+    /** 四个独立按钮随时切换通道；播放期间切换立即发送到设备。 */
+    for (const button of micButtons) {
+      button.addEventListener('click', () => {
+        selectedChannel = Number(button.dataset.channel);
+        micButtons.forEach(item => item.classList.toggle('selected', item === button));
+        channelLabel.textContent = `MIC ${selectedChannel + 1}`;
+        if (playing) sendCommand('select', selectedChannel);
+      });
+    }
+
+    /** 按画布实际像素尺寸绘图，保证高分屏与横竖屏切换后线条清晰。 */
+    function drawWaveform() {
+      const ratio = window.devicePixelRatio || 1;
+      const width = Math.max(1, Math.floor(canvas.clientWidth * ratio));
+      const height = Math.max(1, Math.floor(canvas.clientHeight * ratio));
+      if (canvas.width !== width || canvas.height !== height) {
+        canvas.width = width;
+        canvas.height = height;
+      }
+      canvasContext.fillStyle = '#0b0e10';
+      canvasContext.fillRect(0, 0, width, height);
+      canvasContext.strokeStyle = '#22c55e';
+      canvasContext.lineWidth = 2 * ratio;
+      canvasContext.beginPath();
+      for (let index = 0; index < latestWaveform.length; index++) {
+        const x = index * width / Math.max(1, latestWaveform.length - 1);
+        const y = height * (0.5 - latestWaveform[index] * 0.44);
+        if (index === 0) canvasContext.moveTo(x, y);
+        else canvasContext.lineTo(x, y);
+      }
+      canvasContext.stroke();
+      requestAnimationFrame(drawWaveform);
+    }
+    drawWaveform();
+  </script>
+</body>
+</html>

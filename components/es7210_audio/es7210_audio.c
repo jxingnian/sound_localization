@@ -134,9 +134,25 @@ esp_err_t es7210_audio_init(const es7210_audio_config_t *config,
     ret = i2c_new_master_bus(&i2c_config, &context->i2c_bus);
     ESP_GOTO_ON_ERROR(ret, fail, TAG, "创建 ES7210 I2C 总线失败");
 
+    /*
+     * 先使用 ESP-IDF 原生 7 位地址探测接口确认硬件应答。esp_codec_dev 的地址字段
+     * 沿用旧驱动约定，要求传入包含最低读写位的 8 位写地址，并会在内部右移一位。
+     * 因此原理图标注的 0x41 必须转换成 0x82 后再交给官方编解码器组件。
+     */
+    ret = i2c_master_probe(context->i2c_bus, config->i2c_address_7bit, 100);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG,
+                 "ES7210 在 7 位地址 0x%02X 无应答，SDA=GPIO%d，SCL=GPIO%d",
+                 config->i2c_address_7bit,
+                 config->i2c_sda_gpio,
+                 config->i2c_scl_gpio);
+        ret = ESP_ERR_NOT_FOUND;
+        goto fail;
+    }
+
     audio_codec_i2c_cfg_t codec_i2c_config = {
         .port = config->i2c_port,
-        .addr = config->i2c_address,
+        .addr = (uint8_t)(config->i2c_address_7bit << 1U),
         .bus_handle = context->i2c_bus,
     };
     context->control_interface = audio_codec_new_i2c_ctrl(&codec_i2c_config);
@@ -161,8 +177,8 @@ esp_err_t es7210_audio_init(const es7210_audio_config_t *config,
         .mclk_div = I2S_MCLK_MULTIPLE_256,
     };
     context->codec_interface = es7210_codec_new(&es7210_config);
-    ESP_GOTO_ON_FALSE(context->codec_interface != NULL, ESP_ERR_NO_MEM, fail,
-                      TAG, "创建 ES7210 编解码器接口失败");
+    ESP_GOTO_ON_FALSE(context->codec_interface != NULL, ESP_FAIL, fail,
+                      TAG, "ES7210 寄存器初始化失败");
 
     esp_codec_dev_cfg_t device_config = {
         .dev_type = ESP_CODEC_DEV_TYPE_IN,
@@ -192,7 +208,7 @@ esp_err_t es7210_audio_init(const es7210_audio_config_t *config,
 
     ESP_LOGI(TAG,
              "ES7210 已就绪: 地址=0x%02X, %" PRIu32 " Hz, 16 bit, 4 通道 TDM",
-             config->i2c_address, config->sample_rate_hz);
+             config->i2c_address_7bit, config->sample_rate_hz);
     *out_handle = context;
     return ESP_OK;
 
