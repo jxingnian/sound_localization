@@ -1,53 +1,50 @@
-| Supported Targets | ESP32 | ESP32-C2 | ESP32-C3 | ESP32-C5 | ESP32-C6 | ESP32-C61 | ESP32-H2 | ESP32-H21 | ESP32-H4 | ESP32-P4 | ESP32-S2 | ESP32-S3 | ESP32-S31 | Linux |
-| ----------------- | ----- | -------- | -------- | -------- | -------- | --------- | -------- | --------- | -------- | -------- | -------- | -------- | --------- | ----- |
+# ESP32-C3 四麦克风声源定位
 
-# Hello World Example
+本工程依据 `doc/SCH_Schematic1_1_2026-11-25.pdf` 的电气连接实现 ES7210 四通道采集、可扩展音频分发和二维声源定位。
 
-Starts a FreeRTOS task to print "Hello World".
+## 已确认的硬件连接
 
-(See the README.md file in the upper level 'examples' directory for more information about examples.)
+| 功能 | ES7210 引脚 | ESP32-C3 | 依据 |
+| --- | --- | --- | --- |
+| I2C 数据 | CDATA | GPIO4 | 原理图网络标签 |
+| I2C 时钟 | CCLK | GPIO5 | 原理图网络标签 |
+| 主时钟 | MCLK | GPIO6 | 原理图网络标签 |
+| TDM 位时钟 | SCLK | GPIO7 | 原理图网络标签 |
+| TDM 帧时钟 | LRCK | GPIO10 | 原理图网络标签 |
+| 四通道数据 | SDOUT1/TDMOUT | GPIO3 | 原理图网络标签 |
+| I2C 地址 | AD0=1、AD1=0 | `0x41` | 原理图标注的 7 位地址 |
 
-## How to use example
+ES7210 的 MIC1 到 MIC4 均已接入模拟麦克风，驱动使用 16 kHz、16 bit、四通道 Philips TDM，数据顺序固定为 MIC1、MIC2、MIC3、MIC4。
 
-Follow detailed instructions provided specifically for this example.
+## 组件结构
 
-Select the instructions depending on Espressif chip installed on your development board:
-
-- [ESP32 Getting Started Guide](https://docs.espressif.com/projects/esp-idf/en/stable/get-started/index.html)
-- [ESP32-S2 Getting Started Guide](https://docs.espressif.com/projects/esp-idf/en/latest/esp32s2/get-started/index.html)
-
-
-## Example folder contents
-
-The project **hello_world** contains one source file in C language [hello_world_main.c](main/hello_world_main.c). The file is located in folder [main](main).
-
-ESP-IDF projects are built using CMake. The project build configuration is contained in `CMakeLists.txt` files that provide set of directives and instructions describing the project's source files and targets (executable, library, or both).
-
-Below is short explanation of remaining files in the project folder.
-
-```
-├── CMakeLists.txt
-├── pytest_hello_world.py      Python script used for automated testing
-├── main
-│   ├── CMakeLists.txt
-│   └── hello_world_main.c
-└── README.md                  This is the file you are currently reading
+```text
+components/
+|-- es7210_audio/          驱动层：I2C 配置、I2S TDM、四通道 PCM 读取
+|-- audio_pipeline/        中间层：引用计数帧池、独立订阅队列、多应用分发
+`-- sound_localization/    应用层：TDOA、亚采样互相关、二维最小二乘、方位角
 ```
 
-For more information on structure and contents of ESP-IDF projects, please refer to Section [Build System](https://docs.espressif.com/projects/esp-idf/en/latest/esp32/api-guides/build-system.html) of the ESP-IDF Programming Guide.
+`audio_pipeline` 是驱动和应用之间唯一的数据边界。后续唤醒词、录音或声学事件检测组件通过 `audio_pipeline_subscribe()` 建立自己的队列，不需要改动 ES7210 驱动或声源定位组件。
 
-## Troubleshooting
+## 坐标与角度
 
-* Program upload failure
+原理图包含电气连接，不包含 PCB 麦克风声学中心的机械坐标。`main/app_main.c` 当前明确配置为 50 mm x 50 mm 方形阵列，通道位置为：MIC1 左后、MIC2 右后、MIC3 左前、MIC4 右前。PCB 实际坐标确定后必须更新 `localization_config.microphones`。
 
-    * Hardware connection is not correct: run `idf.py -p PORT monitor`, and reboot your board to see if there are any output logs.
-    * The baud rate for downloading is too high: lower your baud rate in the `menuconfig` menu, and try again.
+角度以阵列中心为原点：+X 为 0 度，+Y 为 90 度，-X 为 180 度，-Y 为 270 度。
 
-## Technical support and feedback
+## 编译
 
-Please use the following feedback channels:
+Windows：
 
-* For technical queries, go to the [esp32.com](https://esp32.com/) forum
-* For a feature request or bug report, create a [GitHub issue](https://github.com/espressif/esp-idf/issues)
+```powershell
+.\build\sound_localization\build.ps1
+```
 
-We will get back to you as soon as possible.
+Linux：
+
+```bash
+./build/sound_localization/build.sh
+```
+
+构建产物位于 `build/output`。构建脚本只编译，不烧录、不打开串口。

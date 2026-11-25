@@ -1,5 +1,9 @@
 # ESP-IDF 构建输出
-build/
+build/*
+!build/sound_localization/
+build/sound_localization/*
+!build/sound_localization/build.ps1
+!build/sound_localization/build.sh
 *.bin
 *.elf
 *.map
