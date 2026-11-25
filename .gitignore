@@ -1,0 +1,38 @@
+# ESP-IDF 构建输出
+build/
+*.bin
+*.elf
+*.map
+
+# sdkconfig 文件（保留 sdkconfig.ci）
+sdkconfig
+sdkconfig.old
+sdkconfig.defaults.*
+
+# Python 缓存
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+
+# IDE 和编辑器
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# 依赖管理
+dependencies.lock
+managed_components/
+
+# 临时文件
+tmp/
+*.tmp
+*.log
+*.bak
+
+# 其他
+.cache/
