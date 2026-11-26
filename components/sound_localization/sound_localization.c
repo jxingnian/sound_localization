@@ -21,6 +21,15 @@ static const float PI_F = 3.14159265358979323846f;
 /** 互相关搜索允许的最大延迟，16 kHz 下 16 点覆盖 34.3 cm 麦克风间距。 */
 #define SOUND_LOCALIZATION_MAX_LAG_SAMPLES 16
 
+/**
+ * 每次定位使用的最新采样点数。160 点在 16 kHz 下对应 10 ms，足以覆盖当前阵列
+ * 最大约 3.3 个采样点的通道时差，同时把互相关计算量降到原 480 点窗口的三分之一。
+ */
+#define SOUND_LOCALIZATION_ANALYSIS_SAMPLES 160
+
+/** 定位任务每处理一帧后至少阻塞一个系统 tick，保证单核 IDLE 任务能够运行。 */
+#define SOUND_LOCALIZATION_YIELD_TICKS 1
+
 /** 定位组件私有上下文。 */
 struct sound_localization_context {
     sound_localization_config_t config;
@@ -43,13 +52,14 @@ static float sound_localization_clamp(float value, float minimum, float maximum)
 /** @brief 计算四通道整帧 RMS，用于拒绝没有有效声源的静音帧。 */
 static float sound_localization_calculate_rms(const audio_pipeline_frame_t *frame)
 {
-    double energy = 0.0;
+    uint64_t energy = 0;
     const size_t value_count = (size_t)frame->samples_per_channel * frame->channel_count;
     for (size_t index = 0; index < value_count; ++index) {
-        const double value = frame->data[index];
-        energy += value * value;
+        /* 先扩展到 32 位再相乘，避免 int16_t 平方溢出；总能量使用 64 位累加。 */
+        const int32_t value = frame->data[index];
+        energy += (uint64_t)(value * value);
     }
-    return value_count == 0 ? 0.0f : (float)sqrt(energy / value_count);
+    return value_count == 0 ? 0.0f : sqrtf((float)energy / (float)value_count);
 }
 
 /**
@@ -62,38 +72,55 @@ static float sound_localization_correlation_at_lag(const audio_pipeline_frame_t 
                                                    uint8_t target_channel,
                                                    int lag)
 {
-    const int sample_count = frame->samples_per_channel;
-    const int begin = lag < 0 ? -lag : 0;
-    const int end = lag > 0 ? sample_count - lag : sample_count;
+    const int analysis_count =
+        frame->samples_per_channel < SOUND_LOCALIZATION_ANALYSIS_SAMPLES
+            ? frame->samples_per_channel
+            : SOUND_LOCALIZATION_ANALYSIS_SAMPLES;
+    const int window_start = frame->samples_per_channel - analysis_count;
+    const int begin = window_start + (lag < 0 ? -lag : 0);
+    const int end = window_start + (lag > 0 ? analysis_count - lag : analysis_count);
     const int valid_count = end - begin;
     if (valid_count < 8) {
         return 0.0f;
     }
 
-    double reference_mean = 0.0;
-    double target_mean = 0.0;
-    for (int index = begin; index < end; ++index) {
-        reference_mean += frame->data[index * frame->channel_count];
-        target_mean += frame->data[(index + lag) * frame->channel_count + target_channel];
-    }
-    reference_mean /= valid_count;
-    target_mean /= valid_count;
+    int32_t reference_sum = 0;
+    int32_t target_sum = 0;
+    int64_t reference_square_sum = 0;
+    int64_t target_square_sum = 0;
+    int64_t product_sum = 0;
 
-    double numerator = 0.0;
-    double reference_energy = 0.0;
-    double target_energy = 0.0;
+    /*
+     * 使用一次遍历收集 Σx、Σy、Σx²、Σy²、Σxy，再通过恒等式计算去均值相关：
+     * numerator = N*Σxy - Σx*Σy
+     * energy_x = N*Σx² - (Σx)²
+     * 采样值先以 32 位相乘，再累加到 64 位，既保持 PCM16 全精度，也避免 ESP32-C3
+     * 在每个采样点执行软件双精度乘法。
+     */
     for (int index = begin; index < end; ++index) {
-        const double reference =
-            frame->data[index * frame->channel_count] - reference_mean;
-        const double target =
-            frame->data[(index + lag) * frame->channel_count + target_channel] - target_mean;
-        numerator += reference * target;
-        reference_energy += reference * reference;
-        target_energy += target * target;
+        const int32_t reference = frame->data[index * frame->channel_count];
+        const int32_t target =
+            frame->data[(index + lag) * frame->channel_count + target_channel];
+        reference_sum += reference;
+        target_sum += target;
+        reference_square_sum += reference * reference;
+        target_square_sum += target * target;
+        product_sum += reference * target;
     }
 
-    const double denominator = sqrt(reference_energy * target_energy);
-    return denominator <= 1.0 ? 0.0f : (float)(numerator / denominator);
+    const int64_t numerator = (int64_t)valid_count * product_sum -
+                              (int64_t)reference_sum * target_sum;
+    const int64_t reference_energy =
+        (int64_t)valid_count * reference_square_sum -
+        (int64_t)reference_sum * reference_sum;
+    const int64_t target_energy =
+        (int64_t)valid_count * target_square_sum - (int64_t)target_sum * target_sum;
+    if (reference_energy <= 0 || target_energy <= 0) {
+        return 0.0f;
+    }
+
+    const float denominator = sqrtf((float)reference_energy * (float)target_energy);
+    return denominator <= 1.0f ? 0.0f : (float)numerator / denominator;
 }
 
 /**
@@ -138,18 +165,18 @@ static float sound_localization_estimate_delay(const audio_pipeline_frame_t *fra
 static bool sound_localization_geometry_is_valid(
     const sound_localization_microphone_position_t microphones[ES7210_AUDIO_CHANNEL_COUNT])
 {
-    double ata_xx = 0.0;
-    double ata_xy = 0.0;
-    double ata_yy = 0.0;
+    float ata_xx = 0.0f;
+    float ata_xy = 0.0f;
+    float ata_yy = 0.0f;
     for (size_t channel = 1; channel < ES7210_AUDIO_CHANNEL_COUNT; ++channel) {
-        const double dx = microphones[channel].x_m - microphones[0].x_m;
-        const double dy = microphones[channel].y_m - microphones[0].y_m;
+        const float dx = microphones[channel].x_m - microphones[0].x_m;
+        const float dy = microphones[channel].y_m - microphones[0].y_m;
         ata_xx += dx * dx;
         ata_xy += dx * dy;
         ata_yy += dy * dy;
     }
-    const double determinant = ata_xx * ata_yy - ata_xy * ata_xy;
-    return determinant > 1.0e-12;
+    const float determinant = ata_xx * ata_yy - ata_xy * ata_xy;
+    return determinant > 1.0e-12f;
 }
 
 /** @brief 对一帧四通道音频执行完整定位。 */
@@ -165,11 +192,11 @@ static void sound_localization_process_frame(struct sound_localization_context *
         return;
     }
 
-    double ata_xx = 0.0;
-    double ata_xy = 0.0;
-    double ata_yy = 0.0;
-    double atb_x = 0.0;
-    double atb_y = 0.0;
+    float ata_xx = 0.0f;
+    float ata_xy = 0.0f;
+    float ata_yy = 0.0f;
+    float atb_x = 0.0f;
+    float atb_y = 0.0f;
     float correlation_sum = 0.0f;
 
     for (uint8_t channel = 1; channel < ES7210_AUDIO_CHANNEL_COUNT; ++channel) {
@@ -195,7 +222,7 @@ static void sound_localization_process_frame(struct sound_localization_context *
         correlation_sum += peak;
 
         /* 波从声源指向阵列传播，因此 A*u = -c*tau，u 指向声源。 */
-        const double b = -context->config.speed_of_sound_mps * delay_seconds;
+        const float b = -context->config.speed_of_sound_mps * delay_seconds;
         ata_xx += dx * dx;
         ata_xy += dx * dy;
         ata_yy += dy * dy;
@@ -208,20 +235,20 @@ static void sound_localization_process_frame(struct sound_localization_context *
         return;
     }
 
-    const double determinant = ata_xx * ata_yy - ata_xy * ata_xy;
-    if (determinant <= 1.0e-12) {
+    const float determinant = ata_xx * ata_yy - ata_xy * ata_xy;
+    if (determinant <= 1.0e-12f) {
         return;
     }
-    double direction_x = (ata_yy * atb_x - ata_xy * atb_y) / determinant;
-    double direction_y = (ata_xx * atb_y - ata_xy * atb_x) / determinant;
-    const double norm = sqrt(direction_x * direction_x + direction_y * direction_y);
-    if (norm < 1.0e-6) {
+    float direction_x = (ata_yy * atb_x - ata_xy * atb_y) / determinant;
+    float direction_y = (ata_xx * atb_y - ata_xy * atb_x) / determinant;
+    const float norm = sqrtf(direction_x * direction_x + direction_y * direction_y);
+    if (norm < 1.0e-6f) {
         return;
     }
     direction_x /= norm;
     direction_y /= norm;
 
-    float degrees = atan2f((float)direction_y, (float)direction_x) * 180.0f / PI_F;
+    float degrees = atan2f(direction_y, direction_x) * 180.0f / PI_F;
     if (degrees < 0.0f) {
         degrees += 360.0f;
     }
@@ -245,12 +272,37 @@ static void sound_localization_task(void *argument)
             continue;
         }
 
+        /*
+         * 定位结果只对实时方向有意义。若计算期间队列中已经到达更新帧，归还旧帧并
+         * 保留最新帧，防止持续说话时逐帧追赶历史数据而形成不可恢复的处理积压。
+         */
+        while (true) {
+            const audio_pipeline_frame_t *newer_frame = NULL;
+            esp_err_t drain_result = audio_pipeline_receive(
+                context->subscription, &newer_frame, 0);
+            if (drain_result == ESP_ERR_TIMEOUT) {
+                break;
+            }
+            if (drain_result != ESP_OK) {
+                ESP_LOGE(TAG, "清理过时音频帧失败: %s", esp_err_to_name(drain_result));
+                break;
+            }
+            audio_pipeline_release_frame(context->subscription, frame);
+            frame = newer_frame;
+        }
+
         sound_localization_result_t result;
         sound_localization_process_frame(context, frame, &result);
         audio_pipeline_release_frame(context->subscription, frame);
 
         /* 单元素队列只保留最近结果，监控方读取速度不会反向阻塞实时定位。 */
         xQueueOverwrite(context->result_queue, &result);
+
+        /*
+         * ESP32-C3 为单核处理器。即使声音连续触发定位，也必须短暂阻塞定位任务，
+         * 让优先级 0 的 IDLE 任务运行并复位任务看门狗。
+         */
+        vTaskDelay(SOUND_LOCALIZATION_YIELD_TICKS);
     }
 
     context->task = NULL;
