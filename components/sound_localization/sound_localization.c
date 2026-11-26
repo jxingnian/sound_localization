@@ -1,6 +1,6 @@
 /**
  * @file sound_localization.c
- * @brief 基于归一化互相关 TDOA 和二维最小二乘的四麦克风定位实现。
+ * @brief 基于三麦克风全配对 TDOA 和二维最小二乘的声源定位实现。
  */
 
 #include "sound_localization.h"
@@ -38,6 +38,16 @@ struct sound_localization_context {
     TaskHandle_t task;
     TaskHandle_t stop_waiter;
     volatile bool running;
+    bool direction_filter_initialized;
+    float filtered_direction_x;
+    float filtered_direction_y;
+};
+
+/** 三只阵列麦克风的全部无重复配对，顺序同时定义结果中的 pair_delays_us。 */
+static const uint8_t SOUND_LOCALIZATION_PAIRS[SOUND_LOCALIZATION_PAIR_COUNT][2] = {
+    {0, 1},
+    {0, 2},
+    {1, 2},
 };
 
 /** @brief 把浮点值限制到闭区间，避免数值误差产生越界置信度。 */
@@ -49,16 +59,24 @@ static float sound_localization_clamp(float value, float minimum, float maximum)
     return value > maximum ? maximum : value;
 }
 
-/** @brief 计算四通道整帧 RMS，用于拒绝没有有效声源的静音帧。 */
-static float sound_localization_calculate_rms(const audio_pipeline_frame_t *frame)
+/** @brief 只计算三只定位麦克风的 RMS，独立麦克风不会触发定位。 */
+static float sound_localization_calculate_rms(
+    const sound_localization_config_t *config,
+    const audio_pipeline_frame_t *frame)
 {
     uint64_t energy = 0;
-    const size_t value_count = (size_t)frame->samples_per_channel * frame->channel_count;
-    for (size_t index = 0; index < value_count; ++index) {
-        /* 先扩展到 32 位再相乘，避免 int16_t 平方溢出；总能量使用 64 位累加。 */
-        const int32_t value = frame->data[index];
-        energy += (uint64_t)(value * value);
+    for (size_t sample = 0; sample < frame->samples_per_channel; ++sample) {
+        for (size_t microphone = 0;
+             microphone < SOUND_LOCALIZATION_MICROPHONE_COUNT;
+             ++microphone) {
+            const uint8_t channel = config->channel_indices[microphone];
+            /* 先扩展到 32 位再相乘，避免 int16_t 平方溢出；总能量使用 64 位累加。 */
+            const int32_t value = frame->data[sample * frame->channel_count + channel];
+            energy += (uint64_t)(value * value);
+        }
     }
+    const size_t value_count =
+        (size_t)frame->samples_per_channel * SOUND_LOCALIZATION_MICROPHONE_COUNT;
     return value_count == 0 ? 0.0f : sqrtf((float)energy / (float)value_count);
 }
 
@@ -69,6 +87,7 @@ static float sound_localization_calculate_rms(const audio_pipeline_frame_t *fram
  * 目标通道中出现在更晚的采样点。计算时去除各自直流分量，避免 ADC 偏置制造假峰。
  */
 static float sound_localization_correlation_at_lag(const audio_pipeline_frame_t *frame,
+                                                   uint8_t reference_channel,
                                                    uint8_t target_channel,
                                                    int lag)
 {
@@ -98,7 +117,8 @@ static float sound_localization_correlation_at_lag(const audio_pipeline_frame_t 
      * 在每个采样点执行软件双精度乘法。
      */
     for (int index = begin; index < end; ++index) {
-        const int32_t reference = frame->data[index * frame->channel_count];
+        const int32_t reference =
+            frame->data[index * frame->channel_count + reference_channel];
         const int32_t target =
             frame->data[(index + lag) * frame->channel_count + target_channel];
         reference_sum += reference;
@@ -129,6 +149,7 @@ static float sound_localization_correlation_at_lag(const audio_pipeline_frame_t 
  * 亚采样插值显著降低 16 kHz 采样下整数点量化对小尺寸麦克风阵列的影响。
  */
 static float sound_localization_estimate_delay(const audio_pipeline_frame_t *frame,
+                                               uint8_t reference_channel,
                                                uint8_t target_channel,
                                                int maximum_lag,
                                                float *out_peak)
@@ -138,7 +159,7 @@ static float sound_localization_estimate_delay(const audio_pipeline_frame_t *fra
     float best_correlation = -1.0f;
     for (int lag = -maximum_lag; lag <= maximum_lag; ++lag) {
         const float correlation = sound_localization_correlation_at_lag(
-            frame, target_channel, lag);
+            frame, reference_channel, target_channel, lag);
         correlations[lag + SOUND_LOCALIZATION_MAX_LAG_SAMPLES] = correlation;
         if (correlation > best_correlation) {
             best_correlation = correlation;
@@ -163,23 +184,36 @@ static float sound_localization_estimate_delay(const audio_pipeline_frame_t *fra
 
 /** @brief 验证麦克风坐标能够唯一解出二维方向。 */
 static bool sound_localization_geometry_is_valid(
-    const sound_localization_microphone_position_t microphones[ES7210_AUDIO_CHANNEL_COUNT])
+    const sound_localization_microphone_position_t
+        microphones[SOUND_LOCALIZATION_MICROPHONE_COUNT])
 {
-    float ata_xx = 0.0f;
-    float ata_xy = 0.0f;
-    float ata_yy = 0.0f;
-    for (size_t channel = 1; channel < ES7210_AUDIO_CHANNEL_COUNT; ++channel) {
-        const float dx = microphones[channel].x_m - microphones[0].x_m;
-        const float dy = microphones[channel].y_m - microphones[0].y_m;
-        ata_xx += dx * dx;
-        ata_xy += dx * dy;
-        ata_yy += dy * dy;
-    }
-    const float determinant = ata_xx * ata_yy - ata_xy * ata_xy;
-    return determinant > 1.0e-12f;
+    const float dx1 = microphones[1].x_m - microphones[0].x_m;
+    const float dy1 = microphones[1].y_m - microphones[0].y_m;
+    const float dx2 = microphones[2].x_m - microphones[0].x_m;
+    const float dy2 = microphones[2].y_m - microphones[0].y_m;
+
+    /* 叉积是三角形面积的两倍；非零即表示三个声学中心不共线。 */
+    return fabsf(dx1 * dy2 - dy1 * dx2) > 1.0e-8f;
 }
 
-/** @brief 对一帧四通道音频执行完整定位。 */
+/** @brief 验证三只定位麦克风映射到三个不同且存在的 TDM 通道。 */
+static bool sound_localization_channels_are_valid(
+    const uint8_t channel_indices[SOUND_LOCALIZATION_MICROPHONE_COUNT])
+{
+    for (size_t index = 0; index < SOUND_LOCALIZATION_MICROPHONE_COUNT; ++index) {
+        if (channel_indices[index] >= ES7210_AUDIO_CHANNEL_COUNT) {
+            return false;
+        }
+        for (size_t previous = 0; previous < index; ++previous) {
+            if (channel_indices[index] == channel_indices[previous]) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+/** @brief 对一帧四通道音频中的三只阵列麦克风执行完整定位。 */
 static void sound_localization_process_frame(struct sound_localization_context *context,
                                              const audio_pipeline_frame_t *frame,
                                              sound_localization_result_t *result)
@@ -187,7 +221,12 @@ static void sound_localization_process_frame(struct sound_localization_context *
     memset(result, 0, sizeof(*result));
     result->source_sequence = frame->sequence;
     result->source_timestamp_us = frame->timestamp_us;
-    result->rms = sound_localization_calculate_rms(frame);
+    if (frame->channel_count < ES7210_AUDIO_CHANNEL_COUNT ||
+        frame->sample_rate_hz == 0 || frame->samples_per_channel == 0) {
+        return;
+    }
+
+    result->rms = sound_localization_calculate_rms(&context->config, frame);
     if (result->rms < context->config.minimum_rms) {
         return;
     }
@@ -198,15 +237,28 @@ static void sound_localization_process_frame(struct sound_localization_context *
     float atb_x = 0.0f;
     float atb_y = 0.0f;
     float correlation_sum = 0.0f;
+    float delay_samples[SOUND_LOCALIZATION_PAIR_COUNT] = {0};
+    bool pair_constraints_valid = true;
 
-    for (uint8_t channel = 1; channel < ES7210_AUDIO_CHANNEL_COUNT; ++channel) {
-        const float dx = context->config.microphones[channel].x_m -
-                         context->config.microphones[0].x_m;
-        const float dy = context->config.microphones[channel].y_m -
-                         context->config.microphones[0].y_m;
+    for (size_t pair = 0; pair < SOUND_LOCALIZATION_PAIR_COUNT; ++pair) {
+        const uint8_t reference_microphone = SOUND_LOCALIZATION_PAIRS[pair][0];
+        const uint8_t target_microphone = SOUND_LOCALIZATION_PAIRS[pair][1];
+        const uint8_t reference_channel =
+            context->config.channel_indices[reference_microphone];
+        const uint8_t target_channel = context->config.channel_indices[target_microphone];
+        const float dx = context->config.microphones[target_microphone].x_m -
+                         context->config.microphones[reference_microphone].x_m;
+        const float dy = context->config.microphones[target_microphone].y_m -
+                         context->config.microphones[reference_microphone].y_m;
         const float distance = sqrtf(dx * dx + dy * dy);
-        int maximum_lag = (int)ceilf(distance * frame->sample_rate_hz /
-                                     context->config.speed_of_sound_mps) + 1;
+        const float physical_delay_samples =
+            distance * frame->sample_rate_hz / context->config.speed_of_sound_mps;
+
+        /*
+         * 整数互相关必须覆盖物理时差上限所在的最邻近采样点，因此向上取整即可。
+         * 原实现额外加 1 会把搜索范围扩展到物理阵列之外并制造边界假峰。
+         */
+        int maximum_lag = (int)ceilf(physical_delay_samples);
         if (maximum_lag > SOUND_LOCALIZATION_MAX_LAG_SAMPLES) {
             maximum_lag = SOUND_LOCALIZATION_MAX_LAG_SAMPLES;
         }
@@ -215,11 +267,20 @@ static void sound_localization_process_frame(struct sound_localization_context *
         }
 
         float peak = 0.0f;
-        const float delay_samples = sound_localization_estimate_delay(
-            frame, channel, maximum_lag, &peak);
-        const float delay_seconds = delay_samples / frame->sample_rate_hz;
-        result->delays_us[channel] = delay_seconds * 1000000.0f;
+        delay_samples[pair] = sound_localization_estimate_delay(
+            frame, reference_channel, target_channel, maximum_lag, &peak);
+        const float delay_seconds = delay_samples[pair] / frame->sample_rate_hz;
+        result->pair_delays_us[pair] = delay_seconds * 1000000.0f;
         correlation_sum += peak;
+
+        /*
+         * 亚采样插值的量化允许量取半个采样点。超过“物理时差 + 半采样”的结果
+         * 不可能由当前麦克风间距产生，必须在进入方向方程前拒绝。
+         */
+        if (peak < context->config.minimum_correlation ||
+            fabsf(delay_samples[pair]) > physical_delay_samples + 0.5f) {
+            pair_constraints_valid = false;
+        }
 
         /* 波从声源指向阵列传播，因此 A*u = -c*tau，u 指向声源。 */
         const float b = -context->config.speed_of_sound_mps * delay_seconds;
@@ -230,8 +291,21 @@ static void sound_localization_process_frame(struct sound_localization_context *
         atb_y += dy * b;
     }
 
-    result->confidence = correlation_sum / (ES7210_AUDIO_CHANNEL_COUNT - 1U);
-    if (result->confidence < context->config.minimum_correlation) {
+    result->confidence = correlation_sum / SOUND_LOCALIZATION_PAIR_COUNT;
+    if (!pair_constraints_valid) {
+        return;
+    }
+
+    /*
+     * 三对时差必须满足 tau01 + tau12 = tau02。该闭环约束不依赖声源方向，
+     * 能直接拦截混响、噪声或错误相关峰造成的互相矛盾时差。
+     */
+    const float closure_error_samples =
+        delay_samples[0] + delay_samples[2] - delay_samples[1];
+    result->closure_error_us =
+        closure_error_samples * 1000000.0f / frame->sample_rate_hz;
+    if (fabsf(closure_error_samples) >
+        context->config.maximum_closure_error_samples) {
         return;
     }
 
@@ -242,13 +316,42 @@ static void sound_localization_process_frame(struct sound_localization_context *
     float direction_x = (ata_yy * atb_x - ata_xy * atb_y) / determinant;
     float direction_y = (ata_xx * atb_y - ata_xy * atb_x) / determinant;
     const float norm = sqrtf(direction_x * direction_x + direction_y * direction_y);
-    if (norm < 1.0e-6f) {
+    result->direction_norm = norm;
+    if (norm < context->config.minimum_direction_norm ||
+        norm > context->config.maximum_direction_norm) {
         return;
     }
     direction_x /= norm;
     direction_y /= norm;
 
-    float degrees = atan2f(direction_y, direction_x) * 180.0f / PI_F;
+    /*
+     * 在单位圆上对方向向量做一阶低通，而不是直接平均角度。这样跨越 0/360 度时
+     * 不会错误地跳到 180 度，同时能抑制单帧亚采样估计造成的角度抖动。
+     */
+    if (!context->direction_filter_initialized) {
+        context->filtered_direction_x = direction_x;
+        context->filtered_direction_y = direction_y;
+        context->direction_filter_initialized = true;
+    } else {
+        const float alpha = context->config.smoothing_factor;
+        const float filtered_x = (1.0f - alpha) * context->filtered_direction_x +
+                                 alpha * direction_x;
+        const float filtered_y = (1.0f - alpha) * context->filtered_direction_y +
+                                 alpha * direction_y;
+        const float filtered_norm = sqrtf(filtered_x * filtered_x + filtered_y * filtered_y);
+        if (filtered_norm > 1.0e-6f) {
+            context->filtered_direction_x = filtered_x / filtered_norm;
+            context->filtered_direction_y = filtered_y / filtered_norm;
+        } else {
+            /* 前后两个方向完全相反时以最新测量重新建立滤波状态。 */
+            context->filtered_direction_x = direction_x;
+            context->filtered_direction_y = direction_y;
+        }
+    }
+
+    float degrees = atan2f(context->filtered_direction_y,
+                           context->filtered_direction_x) *
+                    180.0f / PI_F;
     if (degrees < 0.0f) {
         degrees += 360.0f;
     }
@@ -318,9 +421,20 @@ esp_err_t sound_localization_init(const sound_localization_config_t *config,
     ESP_RETURN_ON_FALSE(config != NULL && out_handle != NULL && config->pipeline != NULL,
                         ESP_ERR_INVALID_ARG, TAG, "定位配置无效");
     ESP_RETURN_ON_FALSE(config->speed_of_sound_mps > 0.0f &&
+                            config->minimum_rms >= 0.0f &&
                             config->minimum_correlation >= 0.0f &&
-                            config->minimum_correlation <= 1.0f,
-                        ESP_ERR_INVALID_ARG, TAG, "声速或相关阈值无效");
+                            config->minimum_correlation <= 1.0f &&
+                            config->maximum_closure_error_samples >= 0.0f &&
+                            config->minimum_direction_norm > 0.0f &&
+                            config->maximum_direction_norm >=
+                                config->minimum_direction_norm &&
+                            config->smoothing_factor > 0.0f &&
+                            config->smoothing_factor <= 1.0f &&
+                            config->task_stack_size > 0,
+                        ESP_ERR_INVALID_ARG, TAG, "定位阈值或任务参数无效");
+    ESP_RETURN_ON_FALSE(
+        sound_localization_channels_are_valid(config->channel_indices),
+        ESP_ERR_INVALID_ARG, TAG, "定位麦克风通道必须互不相同且位于四通道范围内");
     ESP_RETURN_ON_FALSE(sound_localization_geometry_is_valid(config->microphones),
                         ESP_ERR_INVALID_ARG, TAG, "麦克风坐标不能形成二维阵列");
 
@@ -349,6 +463,11 @@ esp_err_t sound_localization_start(sound_localization_handle_t handle)
     ESP_RETURN_ON_FALSE(handle != NULL, ESP_ERR_INVALID_ARG, TAG, "定位句柄为空");
     ESP_RETURN_ON_FALSE(!handle->running && handle->task == NULL,
                         ESP_ERR_INVALID_STATE, TAG, "定位任务已经运行");
+    /* 每次重新启动都从首个有效方向重新建立滤波状态，避免继承停止前的旧角度。 */
+    handle->direction_filter_initialized = false;
+    handle->filtered_direction_x = 0.0f;
+    handle->filtered_direction_y = 0.0f;
+    xQueueReset(handle->result_queue);
     handle->running = true;
     if (xTaskCreate(sound_localization_task,
                     "sound_localize",

@@ -31,11 +31,11 @@ static const char *TAG = "sound_localization_app";
 #define LOCALIZATION_MINIMUM_RMS 40.0f
 
 /**
- * @brief 启动整条四通道音频与定位链路。
+ * @brief 启动四通道采集、共享分发和三麦克风定位链路。
  *
- * 坐标以阵列中心为原点，当前配置明确表示 50 mm x 50 mm 方形阵列：
- * MIC1 左后、MIC2 右后、MIC3 左前、MIC4 右前。原理图只给出电气连接，量产 PCB
- * 的声学中心坐标确定后，应把下面四组数值更新为 PCB 实测坐标。
+ * 嘉立创 PCB2 回读确认 U1/MIC1、U2/MIC2、U4/MIC4 构成边长约 34 mm 的
+ * 等边三角形，U3/MIC3 是独立麦克风。坐标由 PCB 器件中心换算并以三角形质心
+ * 为原点，X 向 PCB 视图右侧为正，Y 向 PCB 视图上方为正。
  */
 void app_main(void)
 {
@@ -50,15 +50,23 @@ void app_main(void)
 
     sound_localization_config_t localization_config = {
         .pipeline = pipeline,
+        /* TDM 数据仍保留四路；定位层只选择 MIC1、MIC2、MIC4，即通道 0、1、3。 */
+        .channel_indices = {0, 1, 3},
         .microphones = {
-            {.x_m = -0.025f, .y_m = 0.025f},
-            {.x_m = 0.025f, .y_m = 0.025f},
-            {.x_m = -0.025f, .y_m = -0.025f},
-            {.x_m = 0.025f, .y_m = -0.025f},
+            {.x_m = 0.004732f, .y_m = 0.018850f},
+            {.x_m = 0.014069f, .y_m = -0.013713f},
+            {.x_m = -0.018800f, .y_m = -0.005137f},
         },
         .speed_of_sound_mps = 343.0f,
         .minimum_rms = LOCALIZATION_MINIMUM_RMS,
         .minimum_correlation = 0.25f,
+        /* 三对时差闭环误差不得超过 0.75 个采样点，拒绝互相矛盾的相关峰。 */
+        .maximum_closure_error_samples = 0.75f,
+        /* 方向解模长偏离远场单位向量过多时不输出角度。 */
+        .minimum_direction_norm = 0.35f,
+        .maximum_direction_norm = 1.35f,
+        /* 每帧使用 25% 新方向更新单位向量，抑制角度乱跳并保留跟随能力。 */
+        .smoothing_factor = 0.25f,
         .task_stack_size = 6144,
         .task_priority = 6,
     };
@@ -68,7 +76,9 @@ void app_main(void)
     /* 先启动定位消费者，再启动音频生产者，确保第一帧采集数据也能进入定位算法。 */
     ESP_ERROR_CHECK(sound_localization_start(localizer));
     ESP_ERROR_CHECK(audio_pipeline_start(pipeline));
-    ESP_LOGI(TAG, "四麦克风声源定位已启动，当前仅使用串口日志输出定位结果");
+    ESP_LOGI(TAG,
+             "三麦克风声源定位已启动: MIC1/TDM0 + MIC2/TDM1 + MIC4/TDM3，"
+             "MIC3/TDM2 保留给独立应用");
 
     int64_t last_valid_log_timestamp_us = 0;
     while (true) {
@@ -89,23 +99,31 @@ void app_main(void)
             last_valid_log_timestamp_us = result.source_timestamp_us;
             ESP_LOGI(TAG,
                      "帧=%" PRIu32 ", 定位角度=%.1f 度, 置信度=%.2f, RMS=%.1f, "
-                     "延时=[%.1f, %.1f, %.1f, %.1f] us",
+                     "延时=[MIC1-2 %.1f, MIC1-4 %.1f, MIC2-4 %.1f] us, "
+                     "闭环误差=%.1f us, 方向模长=%.2f",
                      result.source_sequence,
                      result.azimuth_degrees,
                      result.confidence,
                      result.rms,
-                     result.delays_us[0],
-                     result.delays_us[1],
-                     result.delays_us[2],
-                     result.delays_us[3]);
+                     result.pair_delays_us[0],
+                     result.pair_delays_us[1],
+                     result.pair_delays_us[2],
+                     result.closure_error_us,
+                     result.direction_norm);
         } else if (!result.valid &&
                    (result.source_sequence % LOCALIZATION_LOG_INTERVAL_FRAMES) == 0U) {
             /* 无效状态限频输出，避免静音时串口日志占用实时音频任务。 */
             ESP_LOGI(TAG,
-                     "帧=%" PRIu32 ", 当前帧未形成有效角度, 置信度=%.2f, RMS=%.1f",
+                     "帧=%" PRIu32 ", 当前帧未形成有效角度, 置信度=%.2f, RMS=%.1f, "
+                     "延时=[%.1f, %.1f, %.1f] us, 闭环误差=%.1f us, 方向模长=%.2f",
                      result.source_sequence,
                      result.confidence,
-                     result.rms);
+                     result.rms,
+                     result.pair_delays_us[0],
+                     result.pair_delays_us[1],
+                     result.pair_delays_us[2],
+                     result.closure_error_us,
+                     result.direction_norm);
         }
     }
 }
