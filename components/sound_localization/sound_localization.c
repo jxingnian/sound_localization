@@ -62,9 +62,11 @@ static float sound_localization_clamp(float value, float minimum, float maximum)
 /** @brief 只计算三只定位麦克风的 RMS，独立麦克风不会触发定位。 */
 static float sound_localization_calculate_rms(
     const sound_localization_config_t *config,
-    const audio_pipeline_frame_t *frame)
+    const audio_pipeline_frame_t *frame,
+    float out_microphone_rms[SOUND_LOCALIZATION_MICROPHONE_COUNT])
 {
-    uint64_t energy = 0;
+    uint64_t total_energy = 0;
+    uint64_t microphone_energy[SOUND_LOCALIZATION_MICROPHONE_COUNT] = {0};
     for (size_t sample = 0; sample < frame->samples_per_channel; ++sample) {
         for (size_t microphone = 0;
              microphone < SOUND_LOCALIZATION_MICROPHONE_COUNT;
@@ -72,12 +74,25 @@ static float sound_localization_calculate_rms(
             const uint8_t channel = config->channel_indices[microphone];
             /* 先扩展到 32 位再相乘，避免 int16_t 平方溢出；总能量使用 64 位累加。 */
             const int32_t value = frame->data[sample * frame->channel_count + channel];
-            energy += (uint64_t)(value * value);
+            const uint64_t squared_value = (uint64_t)(value * value);
+            microphone_energy[microphone] += squared_value;
+            total_energy += squared_value;
         }
+    }
+
+    for (size_t microphone = 0;
+         microphone < SOUND_LOCALIZATION_MICROPHONE_COUNT;
+         ++microphone) {
+        out_microphone_rms[microphone] =
+            frame->samples_per_channel == 0
+                ? 0.0f
+                : sqrtf((float)microphone_energy[microphone] /
+                        (float)frame->samples_per_channel);
     }
     const size_t value_count =
         (size_t)frame->samples_per_channel * SOUND_LOCALIZATION_MICROPHONE_COUNT;
-    return value_count == 0 ? 0.0f : sqrtf((float)energy / (float)value_count);
+    return value_count == 0 ? 0.0f
+                            : sqrtf((float)total_energy / (float)value_count);
 }
 
 /**
@@ -219,15 +234,19 @@ static void sound_localization_process_frame(struct sound_localization_context *
                                              sound_localization_result_t *result)
 {
     memset(result, 0, sizeof(*result));
+    result->rejected_pair_index = UINT8_MAX;
     result->source_sequence = frame->sequence;
     result->source_timestamp_us = frame->timestamp_us;
     if (frame->channel_count < ES7210_AUDIO_CHANNEL_COUNT ||
         frame->sample_rate_hz == 0 || frame->samples_per_channel == 0) {
+        result->rejection_reason = SOUND_LOCALIZATION_REJECTION_INVALID_FRAME;
         return;
     }
 
-    result->rms = sound_localization_calculate_rms(&context->config, frame);
+    result->rms = sound_localization_calculate_rms(
+        &context->config, frame, result->microphone_rms);
     if (result->rms < context->config.minimum_rms) {
+        result->rejection_reason = SOUND_LOCALIZATION_REJECTION_LOW_ENERGY;
         return;
     }
 
@@ -238,7 +257,6 @@ static void sound_localization_process_frame(struct sound_localization_context *
     float atb_y = 0.0f;
     float correlation_sum = 0.0f;
     float delay_samples[SOUND_LOCALIZATION_PAIR_COUNT] = {0};
-    bool pair_constraints_valid = true;
 
     for (size_t pair = 0; pair < SOUND_LOCALIZATION_PAIR_COUNT; ++pair) {
         const uint8_t reference_microphone = SOUND_LOCALIZATION_PAIRS[pair][0];
@@ -269,6 +287,7 @@ static void sound_localization_process_frame(struct sound_localization_context *
         float peak = 0.0f;
         delay_samples[pair] = sound_localization_estimate_delay(
             frame, reference_channel, target_channel, maximum_lag, &peak);
+        result->pair_correlations[pair] = peak;
         const float delay_seconds = delay_samples[pair] / frame->sample_rate_hz;
         result->pair_delays_us[pair] = delay_seconds * 1000000.0f;
         correlation_sum += peak;
@@ -277,9 +296,14 @@ static void sound_localization_process_frame(struct sound_localization_context *
          * 亚采样插值的量化允许量取半个采样点。超过“物理时差 + 半采样”的结果
          * 不可能由当前麦克风间距产生，必须在进入方向方程前拒绝。
          */
-        if (peak < context->config.minimum_correlation ||
-            fabsf(delay_samples[pair]) > physical_delay_samples + 0.5f) {
-            pair_constraints_valid = false;
+        if (result->rejection_reason == SOUND_LOCALIZATION_REJECTION_NONE &&
+            peak < context->config.minimum_correlation) {
+            result->rejection_reason = SOUND_LOCALIZATION_REJECTION_LOW_CORRELATION;
+            result->rejected_pair_index = (uint8_t)pair;
+        } else if (result->rejection_reason == SOUND_LOCALIZATION_REJECTION_NONE &&
+                   fabsf(delay_samples[pair]) > physical_delay_samples + 0.5f) {
+            result->rejection_reason = SOUND_LOCALIZATION_REJECTION_PHYSICAL_DELAY;
+            result->rejected_pair_index = (uint8_t)pair;
         }
 
         /* 波从声源指向阵列传播，因此 A*u = -c*tau，u 指向声源。 */
@@ -292,7 +316,7 @@ static void sound_localization_process_frame(struct sound_localization_context *
     }
 
     result->confidence = correlation_sum / SOUND_LOCALIZATION_PAIR_COUNT;
-    if (!pair_constraints_valid) {
+    if (result->rejection_reason != SOUND_LOCALIZATION_REJECTION_NONE) {
         return;
     }
 
@@ -306,11 +330,13 @@ static void sound_localization_process_frame(struct sound_localization_context *
         closure_error_samples * 1000000.0f / frame->sample_rate_hz;
     if (fabsf(closure_error_samples) >
         context->config.maximum_closure_error_samples) {
+        result->rejection_reason = SOUND_LOCALIZATION_REJECTION_CLOSURE_ERROR;
         return;
     }
 
     const float determinant = ata_xx * ata_yy - ata_xy * ata_xy;
     if (determinant <= 1.0e-12f) {
+        result->rejection_reason = SOUND_LOCALIZATION_REJECTION_GEOMETRY;
         return;
     }
     float direction_x = (ata_yy * atb_x - ata_xy * atb_y) / determinant;
@@ -319,6 +345,7 @@ static void sound_localization_process_frame(struct sound_localization_context *
     result->direction_norm = norm;
     if (norm < context->config.minimum_direction_norm ||
         norm > context->config.maximum_direction_norm) {
+        result->rejection_reason = SOUND_LOCALIZATION_REJECTION_DIRECTION_NORM;
         return;
     }
     direction_x /= norm;

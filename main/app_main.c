@@ -30,6 +30,45 @@ static const char *TAG = "sound_localization_app";
  */
 #define LOCALIZATION_MINIMUM_RMS 40.0f
 
+/** @brief 把失败配对索引转换为与 PCB 器件一致的可读名称。 */
+static const char *localization_pair_name(uint8_t pair_index)
+{
+    static const char *const pair_names[SOUND_LOCALIZATION_PAIR_COUNT] = {
+        "MIC1-MIC2",
+        "MIC1-MIC4",
+        "MIC2-MIC4",
+    };
+    return pair_index < SOUND_LOCALIZATION_PAIR_COUNT
+               ? pair_names[pair_index]
+               : "无指定配对";
+}
+
+/** @brief 把算法拒绝枚举转换为串口诊断文字。 */
+static const char *localization_rejection_name(
+    sound_localization_rejection_reason_t reason)
+{
+    switch (reason) {
+        case SOUND_LOCALIZATION_REJECTION_NONE:
+            return "通过";
+        case SOUND_LOCALIZATION_REJECTION_INVALID_FRAME:
+            return "音频帧格式无效";
+        case SOUND_LOCALIZATION_REJECTION_LOW_ENERGY:
+            return "三麦声音能量低于门限";
+        case SOUND_LOCALIZATION_REJECTION_LOW_CORRELATION:
+            return "麦克风声音相关性低于门限";
+        case SOUND_LOCALIZATION_REJECTION_PHYSICAL_DELAY:
+            return "时差超过麦克风间距物理上限";
+        case SOUND_LOCALIZATION_REJECTION_CLOSURE_ERROR:
+            return "三对时差闭环不一致";
+        case SOUND_LOCALIZATION_REJECTION_GEOMETRY:
+            return "麦克风几何方程不可解";
+        case SOUND_LOCALIZATION_REJECTION_DIRECTION_NORM:
+            return "方向解不符合远场模型";
+        default:
+            return "未知拒绝原因";
+    }
+}
+
 /**
  * @brief 启动四通道采集、共享分发和三麦克风定位链路。
  *
@@ -99,12 +138,19 @@ void app_main(void)
             last_valid_log_timestamp_us = result.source_timestamp_us;
             ESP_LOGI(TAG,
                      "帧=%" PRIu32 ", 定位角度=%.1f 度, 置信度=%.2f, RMS=%.1f, "
+                     "单麦RMS=[%.1f, %.1f, %.1f], 相关=[%.2f, %.2f, %.2f], "
                      "延时=[MIC1-2 %.1f, MIC1-4 %.1f, MIC2-4 %.1f] us, "
                      "闭环误差=%.1f us, 方向模长=%.2f",
                      result.source_sequence,
                      result.azimuth_degrees,
                      result.confidence,
                      result.rms,
+                     result.microphone_rms[0],
+                     result.microphone_rms[1],
+                     result.microphone_rms[2],
+                     result.pair_correlations[0],
+                     result.pair_correlations[1],
+                     result.pair_correlations[2],
                      result.pair_delays_us[0],
                      result.pair_delays_us[1],
                      result.pair_delays_us[2],
@@ -114,11 +160,20 @@ void app_main(void)
                    (result.source_sequence % LOCALIZATION_LOG_INTERVAL_FRAMES) == 0U) {
             /* 无效状态限频输出，避免静音时串口日志占用实时音频任务。 */
             ESP_LOGI(TAG,
-                     "帧=%" PRIu32 ", 当前帧未形成有效角度, 置信度=%.2f, RMS=%.1f, "
+                     "帧=%" PRIu32 ", 拒绝原因=%s, 失败配对=%s, "
+                     "总RMS=%.1f, 单麦RMS=[%.1f, %.1f, %.1f], "
+                     "相关=[MIC1-2 %.2f, MIC1-4 %.2f, MIC2-4 %.2f], "
                      "延时=[%.1f, %.1f, %.1f] us, 闭环误差=%.1f us, 方向模长=%.2f",
                      result.source_sequence,
-                     result.confidence,
+                     localization_rejection_name(result.rejection_reason),
+                     localization_pair_name(result.rejected_pair_index),
                      result.rms,
+                     result.microphone_rms[0],
+                     result.microphone_rms[1],
+                     result.microphone_rms[2],
+                     result.pair_correlations[0],
+                     result.pair_correlations[1],
+                     result.pair_correlations[2],
                      result.pair_delays_us[0],
                      result.pair_delays_us[1],
                      result.pair_delays_us[2],

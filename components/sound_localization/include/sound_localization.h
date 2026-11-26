@@ -61,6 +61,18 @@ typedef struct {
     UBaseType_t task_priority;       /**< 定位任务优先级。 */
 } sound_localization_config_t;
 
+/** @brief 定位结果无效时的确定拒绝原因。 */
+typedef enum {
+    SOUND_LOCALIZATION_REJECTION_NONE = 0,          /**< 当前结果有效，没有被拒绝。 */
+    SOUND_LOCALIZATION_REJECTION_INVALID_FRAME,     /**< 音频帧格式或采样参数无效。 */
+    SOUND_LOCALIZATION_REJECTION_LOW_ENERGY,        /**< 三麦总体 RMS 低于声音门限。 */
+    SOUND_LOCALIZATION_REJECTION_LOW_CORRELATION,   /**< 指定麦克风对的相关峰低于门限。 */
+    SOUND_LOCALIZATION_REJECTION_PHYSICAL_DELAY,    /**< 指定麦克风对的时差超过物理上限。 */
+    SOUND_LOCALIZATION_REJECTION_CLOSURE_ERROR,     /**< 三对时差不能构成一致闭环。 */
+    SOUND_LOCALIZATION_REJECTION_GEOMETRY,          /**< 最小二乘矩阵在当前坐标下不可解。 */
+    SOUND_LOCALIZATION_REJECTION_DIRECTION_NORM,    /**< 方向解模长不满足远场约束。 */
+} sound_localization_rejection_reason_t;
+
 /**
  * @brief 定位结果。
  *
@@ -71,10 +83,17 @@ typedef struct {
     float azimuth_degrees;      /**< 归一化到 [0, 360) 的二维方位角。 */
     float confidence;           /**< 三对归一化互相关峰值的平均值。 */
     float rms;                  /**< 三只定位麦克风的总体均方根幅度。 */
+    /** 三只定位麦克风各自的 RMS，顺序与配置中的 channel_indices 一致。 */
+    float microphone_rms[SOUND_LOCALIZATION_MICROPHONE_COUNT];
+    /** 配对 0-1、0-2、1-2 各自的归一化互相关峰值。 */
+    float pair_correlations[SOUND_LOCALIZATION_PAIR_COUNT];
     /** 配对 0-1、0-2、1-2 的到达时差，正值表示后一只麦克风更晚收到声音。 */
     float pair_delays_us[SOUND_LOCALIZATION_PAIR_COUNT];
     float closure_error_us;     /**< tau01 + tau12 - tau02 的闭环误差。 */
     float direction_norm;       /**< 归一化前方向解的模长，用于诊断解的物理一致性。 */
+    sound_localization_rejection_reason_t rejection_reason; /**< 无效结果的直接原因。 */
+    /** 相关性或物理时差失败时的配对索引；其他原因固定为 0xFF。 */
+    uint8_t rejected_pair_index;
     uint32_t source_sequence;   /**< 生成该结果的音频帧序号。 */
     int64_t source_timestamp_us; /**< 对应音频帧的时间戳。 */
 } sound_localization_result_t;
